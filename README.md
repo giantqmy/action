@@ -186,7 +186,7 @@ ros2 run image_tools cam2image --ros-args -p frequency:=30.0
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `server_url` | http://127.0.0.1:8080/v1/chat/completions | llama.cpp 服务器地址 |
-| `prompt` | 请描述图片中人物的行为动作 | 发送给模型的提示词 |
+| `prompt_template` | (见下方) | 发送给模型的提示词模板，支持 `{categories_text}` 和 `{valid_ids}` 占位符 |
 | `confidence_threshold` | 0.5 | 最低检测置信度 |
 | `target_classes` | ["person"] | 只处理的类别（空=全部） |
 | `max_detections` | 3 | 每帧最多处理几个检测框 |
@@ -194,6 +194,92 @@ ros2 run image_tools cam2image --ros-args -p frequency:=30.0
 | `detection_topic` | /yolov11/detections | 订阅的检测话题 |
 | `image_topic` | /camera/image_raw | 订阅的图像话题 |
 | `behavior_topic` | /llama/behavior | 行为描述输出话题 |
+
+## 水域安全行为识别 Prompt
+
+LLaMA 节点内置了一套水域安全行为识别 prompt 模板，启动时自动将行为类别填入占位符，发送给多模态大模型。
+
+### 默认 Prompt 模板
+
+```
+你是一个智能水域安全行为识别系统，部署于监控摄像头端，负责实时分析画面中人物的行为并判断安全风险等级。
+
+## 识别原则
+仅根据画面中可见的动作姿态进行判断，不做臆测或推断
+
+## 可识别的行为类别
+{categories_text}
+
+## 输出要求
+请严格按以下 JSON 格式输出，不要包含其他内容：
+{
+  "behavior_id": "<行为ID>",
+  "behavior_label": "<行为英文标签>",
+  "description": "<简练行为描述>",
+  "severity": "<严重等级: critical/warning/normal>",
+  "confidence": <0.7-1.0的置信度>
+}
+
+behavior_id 必须是以下之一: {valid_ids}
+如果无法确定行为，返回 unknown。
+请基于图像内容客观分析，不要臆测。
+```
+
+`{categories_text}` 和 `{valid_ids}` 在节点启动时由内置行为类别定义自动填充，无需手动配置。
+
+### 行为类别定义
+
+节点编译时内置了以下 6 种水域安全行为类别（C++ 源码中 `defaultBehaviorClasses()`）：
+
+| ID | 中文标签 | 英文标签 | 严重等级 | 描述 |
+|----|---------|---------|---------|------|
+| 0 | 溺水 | drowning | critical | 四肢无规律挣扎，有溺水风险。 |
+| 1 | 游泳 | swimming | normal | 人员在水中正常游泳。 |
+| 2 | 攀爬栏杆 | climbing | warning | 人员攀爬或翻越栏杆。 |
+| 3 | 正常行走 | normal_walking | normal | 岸上人员正常行走或站立。 |
+| 4 | 正在救援 | waterhelping | normal | 水中人员抱住红色救生圈。 |
+| 5 | 在船上 | aboard | normal | 人员在船上或在开船。 |
+
+### 占位符填充后的 Prompt 示例
+
+`{categories_text}` 填充后形如：
+
+```
+0: 溺水 (drowning, critical) - 四肢无规律挣扎，有溺水风险。
+1: 游泳 (swimming, normal) - 人员在水中正常游泳。
+2: 攀爬栏杆 (climbing, warning) - 人员攀爬或翻越栏杆。
+3: 正常行走 (normal_walking, normal) - 岸上人员正常行走或站立。
+4: 正在救援 (waterhelping, normal) - 水中人员抱住红色救生圈。
+5: 在船上 (aboard, normal) - 人员在船上或在开船。
+```
+
+`{valid_ids}` 填充后形如：
+
+```
+0, 1, 2, 3, 4, 5
+```
+
+### 模型输出示例
+
+```json
+{
+  "behavior_id": "0",
+  "behavior_label": "drowning",
+  "description": "人员在水中四肢无规律挣扎，头部时沉时浮",
+  "severity": "critical",
+  "confidence": 0.92
+}
+```
+
+### 自定义 Prompt
+
+如需修改 prompt，通过 ROS2 参数 `prompt_template` 覆盖即可。保留 `{categories_text}` 和 `{valid_ids}` 占位符以确保行为类别动态注入：
+
+```bash
+# 启动时覆盖 prompt_template
+ros2 run llama_behavior_ros2 llama_behavior_node \
+  --ros-args -p prompt_template:="你的自定义prompt，保留{categories_text}和{valid_ids}"
+```
 
 ## ROS2 话题一览
 
