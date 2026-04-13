@@ -3,6 +3,7 @@
 #include <curl/curl.h>
 #include <opencv2/imgcodecs.hpp>
 #include <algorithm>
+#include <chrono>
 #include <sstream>
 #include <iomanip>
 
@@ -232,13 +233,20 @@ void LlamaBehaviorNode::syncCallback(
     const vision_msgs::msg::Detection2DArray::ConstSharedPtr det_msg,
     const sensor_msgs::msg::Image::ConstSharedPtr img_msg)
 {
+    // ============================================================
+    // 时延测量: LLaMA 节点的主流程各阶段打点
+    // 其中 t_crop 到 t_thread_spawn 之间是同步预处理耗时
+    // t_llama 是异步线程中的 HTTP 调用耗时（最大瓶颈）
+    // ============================================================
+    auto t_cb_start = std::chrono::high_resolution_clock::now();
+
     // Skip if still processing previous frame
     if (processing_.load()) {
         RCLCPP_DEBUG(get_logger(), "Skipping frame, still processing...");
         return;
     }
 
-    // Convert ROS image to OpenCV
+    // [阶段1] Convert ROS image to OpenCV
     cv_bridge::CvImagePtr cv_ptr;
     try {
         cv_ptr = cv_bridge::toCvCopy(img_msg, sensor_msgs::image_encodings::BGR8);
@@ -246,10 +254,11 @@ void LlamaBehaviorNode::syncCallback(
         RCLCPP_ERROR(get_logger(), "cv_bridge exception: %s", e.what());
         return;
     }
+    auto t_convert = std::chrono::high_resolution_clock::now();
 
     cv::Mat image = cv_ptr->image;
 
-    // Filter detections
+    // [阶段2] 过滤检测结果（按置信度 + 类别）
     std::vector<std::pair<int, std::string>> valid_dets;
     for (size_t i = 0; i < det_msg->detections.size(); ++i) {
         const auto &det = det_msg->detections[i];
@@ -272,10 +281,11 @@ void LlamaBehaviorNode::syncCallback(
         valid_dets.push_back({static_cast<int>(i), cls});
         if (static_cast<int>(valid_dets.size()) >= max_detections_) break;
     }
+    auto t_filter = std::chrono::high_resolution_clock::now();
 
     if (valid_dets.empty()) return;
 
-    // Crop and encode
+    // [阶段3] 裁剪目标区域 + JPEG编码 + Base64编码
     std::vector<std::string> images_b64;
     std::vector<std::string> class_names;
 
@@ -286,20 +296,50 @@ void LlamaBehaviorNode::syncCallback(
             class_names.push_back(cls);
         }
     }
+    auto t_crop = std::chrono::high_resolution_clock::now();
 
     if (images_b64.empty()) return;
 
-    // Process asynchronously
+    // 计算同步阶段耗时（这些在主线程阻塞）
+    float ms_sync_convert = std::chrono::duration<float, std::milli>(t_convert - t_cb_start).count();
+    float ms_sync_filter = std::chrono::duration<float, std::milli>(t_filter - t_convert).count();
+    float ms_sync_crop   = std::chrono::duration<float, std::milli>(t_crop - t_filter).count();
+    float ms_sync_total  = std::chrono::duration<float, std::milli>(t_crop - t_cb_start).count();
+
+    RCLCPP_INFO(get_logger(),
+        "[LLAMA-TIMING-SYNC] convert=%.1fms | filter=%.1fms | crop+encode=%.1fms | sync_total=%.1fms | dets=%zu",
+        ms_sync_convert, ms_sync_filter, ms_sync_crop, ms_sync_total, images_b64.size());
+
+    // [阶段4] 异步调用 LLaMA 服务器（HTTP请求是最大时延瓶颈）
     processing_.store(true);
     auto self = this->shared_from_this();
-    std::thread([this, self, images_b64, class_names]() {
+    std::thread([this, self, images_b64, class_names, t_crop]() {
+        auto t_thread_start = std::chrono::high_resolution_clock::now();
+
         std::string result = callLlamaServer(images_b64, class_names);
+
+        auto t_llama = std::chrono::high_resolution_clock::now();
+
         processing_.store(false);
 
         if (!result.empty()) {
             auto msg = std_msgs::msg::String();
             msg.data = result;
             behavior_pub_->publish(msg);
+        }
+        auto t_pub = std::chrono::high_resolution_clock::now();
+
+        // 异步阶段耗时
+        float ms_queue     = std::chrono::duration<float, std::milli>(t_thread_start - t_crop).count();
+        float ms_llama     = std::chrono::duration<float, std::milli>(t_llama - t_thread_start).count();
+        float ms_publish   = std::chrono::duration<float, std::milli>(t_pub - t_llama).count();
+        float ms_async     = std::chrono::duration<float, std::milli>(t_pub - t_crop).count();
+
+        RCLCPP_INFO(get_logger(),
+            "[LLAMA-TIMING-ASYNC] queue=%.1fms | llama_http=%.1fms | publish=%.1fms | async_total=%.1fms",
+            ms_queue, ms_llama, ms_publish, ms_async);
+
+        if (!result.empty()) {
             RCLCPP_INFO(get_logger(), "Behavior result: %s", result.c_str());
         }
     }).detach();
@@ -340,8 +380,9 @@ std::string LlamaBehaviorNode::callLlamaServer(
     const std::vector<std::string> &images_b64,
     const std::vector<std::string> &class_names)
 {
-    // Build JSON manually (avoids nlohmann-json dependency)
-    // OpenAI-compatible format for llama.cpp server
+    auto t_fn_start = std::chrono::high_resolution_clock::now();
+
+    // [细粒度1] 构建 JSON 请求体
     std::ostringstream json;
     json << "{"
          << "\"model\":\"ggml-model\","
@@ -363,8 +404,9 @@ std::string LlamaBehaviorNode::callLlamaServer(
          << "}";
 
     std::string json_str = json.str();
+    auto t_json = std::chrono::high_resolution_clock::now();
 
-    // CURL request
+    // [细粒度2] CURL 初始化
     CURL *curl = curl_easy_init();
     if (!curl) {
         RCLCPP_ERROR(get_logger(), "Failed to init CURL");
@@ -381,29 +423,32 @@ std::string LlamaBehaviorNode::callLlamaServer(
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlWriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
+    auto t_curl_setup = std::chrono::high_resolution_clock::now();
 
+    // [细粒度3] HTTP 请求 — 通常是最大时延瓶颈
     CURLcode res = curl_easy_perform(curl);
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
+    auto t_http = std::chrono::high_resolution_clock::now();
 
     if (res != CURLE_OK) {
         RCLCPP_ERROR(get_logger(), "CURL error: %s", curl_easy_strerror(res));
+        float ms_total = std::chrono::duration<float, std::milli>(t_http - t_fn_start).count();
+        RCLCPP_WARN(get_logger(), "[LLAMA-TIMING-HTTP] failed after %.1fms (CURL error: %s)",
+                     ms_total, curl_easy_strerror(res));
         return "";
     }
 
-    // Simple JSON response parsing - extract "content" from response
-    // Find "content":"..." in the response
+    // [细粒度4] 解析响应
     size_t content_pos = response.find("\"content\":\"");
     if (content_pos == std::string::npos) {
-        // Try alternative format with array
         content_pos = response.find("\"content\":");
         if (content_pos == std::string::npos) {
             RCLCPP_WARN(get_logger(), "Could not parse response: %s", response.c_str());
-            return response.substr(0, 200);  // Return raw response fragment
+            return response.substr(0, 200);
         }
     }
 
-    // Simple extraction for string content
     size_t start = response.find("\"", content_pos + 10);
     if (start == std::string::npos) return "";
     start++;
@@ -425,6 +470,19 @@ std::string LlamaBehaviorNode::callLlamaServer(
             content += response[i];
         }
     }
+    auto t_parse = std::chrono::high_resolution_clock::now();
+
+    // ---- 细粒度耗时输出 ----
+    float ms_json_build  = std::chrono::duration<float, std::milli>(t_json - t_fn_start).count();
+    float ms_curl_setup  = std::chrono::duration<float, std::milli>(t_curl_setup - t_json).count();
+    float ms_http        = std::chrono::duration<float, std::milli>(t_http - t_curl_setup).count();
+    float ms_parse       = std::chrono::duration<float, std::milli>(t_parse - t_http).count();
+    float ms_total       = std::chrono::duration<float, std::milli>(t_parse - t_fn_start).count();
+
+    RCLCPP_INFO(get_logger(),
+        "[LLAMA-TIMING-HTTP] json_build=%.1fms | curl_setup=%.1fms | http_request=%.1fms | "
+        "parse=%.1fms | total=%.1fms | response_size=%zu bytes",
+        ms_json_build, ms_curl_setup, ms_http, ms_parse, ms_total, response.size());
 
     return content;
 }

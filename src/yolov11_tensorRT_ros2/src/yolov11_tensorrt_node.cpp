@@ -93,7 +93,13 @@ Yolov11TensorRTNode::~Yolov11TensorRTNode()
 
 void Yolov11TensorRTNode::imageCallback(const sensor_msgs::msg::Image::ConstSharedPtr msg)
 {
-    // Convert ROS image to OpenCV
+    // ============================================================
+    // 时延测量: 各阶段打点，通过 RCLCPP_INFO 输出毫秒级耗时
+    // 优化时重点关注 t_infer（TensorRT推理）和 t_total（端到端）
+    // ============================================================
+    auto t_cb_start = std::chrono::high_resolution_clock::now();
+
+    // [阶段1] Convert ROS image to OpenCV
     cv_bridge::CvImagePtr cv_ptr;
     try {
         cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
@@ -101,30 +107,46 @@ void Yolov11TensorRTNode::imageCallback(const sensor_msgs::msg::Image::ConstShar
         RCLCPP_ERROR(get_logger(), "cv_bridge exception: %s", e.what());
         return;
     }
+    auto t_convert = std::chrono::high_resolution_clock::now();
 
     cv::Mat image = cv_ptr->image;
     int img_width = image.cols;
     int img_height = image.rows;
 
-    // Run inference
-    auto t_start = std::chrono::high_resolution_clock::now();
+    // [阶段2] TensorRT 推理 — 这是最大的时延瓶颈，优化时优先关注
     detector_->Inference(image);
-    auto t_end = std::chrono::high_resolution_clock::now();
-    float infer_time = std::chrono::duration<float, std::milli>(t_end - t_start).count();
+    auto t_infer = std::chrono::high_resolution_clock::now();
 
     int num_objects = static_cast<int>(detector_->DetectiontRects_.size()) / 6;
-    RCLCPP_DEBUG(get_logger(), "Inference: %.2f ms, objects: %d", infer_time, num_objects);
 
-    // Publish detection results
+    // [阶段3] 构建检测结果消息
     auto det_msg = buildDetectionMsg(detector_->DetectiontRects_, img_width, img_height, msg->header);
-    detection_pub_->publish(det_msg);
+    auto t_build_msg = std::chrono::high_resolution_clock::now();
 
-    // Publish annotated image
+    // [阶段4] 绘制检测框并发布可视化图像
     if (publish_result_image_ && num_objects > 0) {
         cv::Mat result_image = drawDetections(image, detector_->DetectiontRects_, img_width, img_height);
         auto result_msg = cv_bridge::CvImage(msg->header, "bgr8", result_image).toImageMsg();
         result_image_pub_.publish(result_msg);
     }
+    auto t_draw = std::chrono::high_resolution_clock::now();
+
+    // [阶段5] 发布检测结果
+    detection_pub_->publish(det_msg);
+    auto t_publish = std::chrono::high_resolution_clock::now();
+
+    // ---- 输出各阶段耗时 ----
+    float ms_convert   = std::chrono::duration<float, std::milli>(t_convert - t_cb_start).count();
+    float ms_infer     = std::chrono::duration<float, std::milli>(t_infer - t_convert).count();
+    float ms_build_msg = std::chrono::duration<float, std::milli>(t_build_msg - t_infer).count();
+    float ms_draw      = std::chrono::duration<float, std::milli>(t_draw - t_build_msg).count();
+    float ms_publish   = std::chrono::duration<float, std::milli>(t_publish - t_draw).count();
+    float ms_total     = std::chrono::duration<float, std::milli>(t_publish - t_cb_start).count();
+
+    RCLCPP_INFO(get_logger(),
+        "[YOLO-TIMING] convert=%.1fms | infer=%.1fms | build_msg=%.1fms | draw=%.1fms | "
+        "publish=%.1fms | total=%.1fms | objects=%d",
+        ms_convert, ms_infer, ms_build_msg, ms_draw, ms_publish, ms_total, num_objects);
 }
 
 vision_msgs::msg::Detection2DArray Yolov11TensorRTNode::buildDetectionMsg(
