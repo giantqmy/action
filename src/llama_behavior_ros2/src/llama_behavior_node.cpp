@@ -57,13 +57,107 @@ static size_t curlWriteCallback(void *contents, size_t size, size_t nmemb, std::
     return total;
 }
 
+// ======================== Default behavior classes ========================
+std::vector<BehaviorClass> LlamaBehaviorNode::defaultBehaviorClasses()
+{
+    return {
+        {"0", "溺水",     "drowning",      "critical", "四肢无规律挣扎，有溺水风险。"},
+        {"1", "游泳",     "swimming",      "normal",   "人员在水中正常游泳。"},
+        {"2", "攀爬栏杆", "climbing",      "warning",  "人员攀爬或翻越栏杆。"},
+        {"3", "正常行走", "normal_walking", "normal",   "岸上人员正常行走或站立。"},
+        {"4", "正在救援", "waterhelping",  "normal",   "水中人员抱住红色救生圈。"},
+        {"5", "在船上",   "aboard",        "normal",   "人员在船上或在开船。"},
+    };
+}
+
+// ======================== Build categories_text ========================
+std::string LlamaBehaviorNode::buildCategoriesText() const
+{
+    // Format: "0: 溺水 (drowning, critical) - 四肢无规律挣扎，有溺水风险。\n..."
+    std::ostringstream ss;
+    for (size_t i = 0; i < behavior_classes_.size(); ++i) {
+        const auto &bc = behavior_classes_[i];
+        ss << bc.id << ": " << bc.label_cn << " (" << bc.label_en << ", " << bc.severity
+           << ") - " << bc.description;
+        if (i + 1 < behavior_classes_.size()) ss << "\n";
+    }
+    return ss.str();
+}
+
+// ======================== Build valid_ids ========================
+std::string LlamaBehaviorNode::buildValidIds() const
+{
+    std::ostringstream ss;
+    for (size_t i = 0; i < behavior_classes_.size(); ++i) {
+        if (i > 0) ss << ", ";
+        ss << behavior_classes_[i].id;
+    }
+    return ss.str();
+}
+
+// ======================== Build prompt ========================
+std::string LlamaBehaviorNode::buildPrompt() const
+{
+    std::string prompt = prompt_template_;
+
+    const std::string placeholder_categories = "{categories_text}";
+    const std::string placeholder_ids = "{valid_ids}";
+
+    std::string categories_text = buildCategoriesText();
+    std::string valid_ids = buildValidIds();
+
+    // Replace {categories_text}
+    size_t pos = 0;
+    while ((pos = prompt.find(placeholder_categories, pos)) != std::string::npos) {
+        prompt.replace(pos, placeholder_categories.length(), categories_text);
+        pos += categories_text.length();
+    }
+
+    // Replace {valid_ids}
+    pos = 0;
+    while ((pos = prompt.find(placeholder_ids, pos)) != std::string::npos) {
+        prompt.replace(pos, placeholder_ids.length(), valid_ids);
+        pos += valid_ids.length();
+    }
+
+    return prompt;
+}
+
 // ======================== Constructor ========================
 LlamaBehaviorNode::LlamaBehaviorNode(const rclcpp::NodeOptions &options)
     : Node("llama_behavior_node", options)
 {
+    // Default prompt template (water safety behavior recognition)
+    // Note: {categories_text} and {valid_ids} are placeholders filled at runtime.
+    // Single braces in the JSON example are literal for the model, NOT placeholders.
+    const std::string default_prompt_template =
+        "你是一个智能水域安全行为识别系统，部署于监控摄像头端，负责实时分析画面中人物的行为并判断安全风险等级。\n"
+        "\n"
+        "## 识别原则\n"
+        "仅根据画面中可见的动作姿态进行判断，不做臆测或推断\n"
+        "\n"
+        "## 可识别的行为类别\n"
+        "{categories_text}\n"
+        "\n"
+        "## 输出要求\n"
+        "请严格按以下 JSON 格式输出，不要包含其他内容：\n"
+        "```json\n"
+        "{\n"
+        "  \"behavior_id\": \"<行为ID>\",\n"
+        "  \"behavior_label\": \"<行为英文标签>\",\n"
+        "  \"description\": \"<简练行为描述>\",\n"
+        "  \"severity\": \"<严重等级: critical/warning/normal>\",\n"
+        "  \"confidence\": <0.7-1.0的置信度>\n"
+        "}\n"
+        "```\n"
+        "\n"
+        "behavior_id 必须是以下之一: {valid_ids}\n"
+        "如果无法确定行为，返回 unknown。\n"
+        "请基于图像内容客观分析，不要臆测。";
+
     // Declare and get parameters
     declare_parameter<std::string>("server_url", "http://127.0.0.1:8080/v1/chat/completions");
-    declare_parameter<std::string>("prompt", "请描述图片中人物的行为动作");
+    declare_parameter<std::string>("prompt_template", default_prompt_template);
     declare_parameter<double>("confidence_threshold", 0.5);
     declare_parameter<std::vector<std::string>>("target_classes", std::vector<std::string>{"person"});
     declare_parameter<int>("max_detections", 3);
@@ -74,19 +168,25 @@ LlamaBehaviorNode::LlamaBehaviorNode(const rclcpp::NodeOptions &options)
     declare_parameter<int>("min_crop_size", 50);
 
     server_url_ = get_parameter("server_url").as_string();
-    prompt_ = get_parameter("prompt").as_string();
+    prompt_template_ = get_parameter("prompt_template").as_string();
     confidence_threshold_ = get_parameter("confidence_threshold").as_double();
     target_classes_ = get_parameter("target_classes").as_string_array();
     max_detections_ = get_parameter("max_detections").as_int();
     queue_size_ = get_parameter("queue_size").as_int();
     min_crop_size_ = get_parameter("min_crop_size").as_int();
 
+    // Initialize behavior classes
+    behavior_classes_ = defaultBehaviorClasses();
+
+    // Build the final prompt by filling placeholders
+    prompt_ = buildPrompt();
+
     std::string detection_topic = get_parameter("detection_topic").as_string();
     std::string image_topic = get_parameter("image_topic").as_string();
     std::string behavior_topic = get_parameter("behavior_topic").as_string();
 
     RCLCPP_INFO(get_logger(), "Server URL: %s", server_url_.c_str());
-    RCLCPP_INFO(get_logger(), "Prompt: %s", prompt_.c_str());
+    RCLCPP_INFO(get_logger(), "Behavior classes: %zu loaded", behavior_classes_.size());
     RCLCPP_INFO(get_logger(), "Confidence threshold: %.2f", confidence_threshold_);
     RCLCPP_INFO(get_logger(), "Min crop size: %d px", min_crop_size_);
 
@@ -100,6 +200,8 @@ LlamaBehaviorNode::LlamaBehaviorNode(const rclcpp::NodeOptions &options)
     } else {
         RCLCPP_INFO(get_logger(), "Target classes: ALL");
     }
+
+    RCLCPP_INFO(get_logger(), "Final prompt preview (first 120 chars): %.120s...", prompt_.c_str());
 
     // Initialize CURL globally
     curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -256,7 +358,7 @@ std::string LlamaBehaviorNode::callLlamaServer(
     }
 
     json << "]}],"
-         << "\"max_tokens\":256,"
+         << "\"max_tokens\":512,"
          << "\"temperature\":0.1"
          << "}";
 

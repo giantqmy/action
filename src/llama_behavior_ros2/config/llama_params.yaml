@@ -3,8 +3,15 @@ llama_behavior_node:
     # llama.cpp server endpoint
     server_url: "http://127.0.0.1:8080/v1/chat/completions"
 
-    # Prompt for the multimodal model
-    prompt: "请描述图片中人物的行为动作"
+    # Prompt template for the multimodal model.
+    # Placeholders {categories_text} and {valid_ids} are filled automatically
+    # from the behavior class definitions compiled into the node.
+    #
+    # Override this parameter if you need a custom prompt, but keep the
+    # {categories_text} and {valid_ids} placeholders for dynamic substitution.
+    #
+    # NOTE: The single braces in the JSON example below are literal for the model.
+    prompt_template: "你是一个智能水域安全行为识别系统，部署于监控摄像头端，负责实时分析画面中人物的行为并判断安全风险等级。\n\n## 识别原则\n仅根据画面中可见的动作姿态进行判断，不做臆测或推断\n\n## 可识别的行为类别\n{categories_text}\n\n## 输出要求\n请严格按以下 JSON 格式输出，不要包含其他内容：\n```json\n{\n  \"behavior_id\": \"<行为ID>\",\n  \"behavior_label\": \"<行为英文标签>\",\n  \"description\": \"<简练行为描述>\",\n  \"severity\": \"<严重等级: critical/warning/normal>\",\n  \"confidence\": <0.7-1.0的置信度>\n}\n```\n\nbehavior_id 必须是以下之一: {valid_ids}\n如果无法确定行为，返回 unknown。\n请基于图像内容客观分析，不要臆测。"
 
     # Minimum detection confidence to consider
     confidence_threshold: 0.5

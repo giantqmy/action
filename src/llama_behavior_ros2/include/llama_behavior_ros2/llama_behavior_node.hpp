@@ -24,6 +24,16 @@ using DetectionSync = message_filters::sync_policies::ApproximateTime<
     vision_msgs::msg::Detection2DArray,
     sensor_msgs::msg::Image>;
 
+/// Behavior class definition (C++ equivalent of Python _default_classes)
+struct BehaviorClass
+{
+    std::string id;         // e.g. "0"
+    std::string label_cn;   // Chinese label
+    std::string label_en;   // English label
+    std::string severity;   // critical / warning / normal
+    std::string description;
+};
+
 class LlamaBehaviorNode : public rclcpp::Node
 {
 public:
@@ -39,14 +49,30 @@ private:
     std::string callLlamaServer(const std::vector<std::string> &images_b64,
                                  const std::vector<std::string> &class_names);
 
+    /// Build the categories_text string from behavior_classes_
+    std::string buildCategoriesText() const;
+
+    /// Build the valid_ids string (comma-separated) from behavior_classes_
+    std::string buildValidIds() const;
+
+    /// Build the final prompt by filling placeholders in prompt_template_
+    std::string buildPrompt() const;
+
+    /// Default behavior class definitions (水域安全行为识别)
+    static std::vector<BehaviorClass> defaultBehaviorClasses();
+
     // Parameters
     std::string server_url_;
-    std::string prompt_;
+    std::string prompt_template_;  // prompt template with {categories_text} and {valid_ids} placeholders
+    std::string prompt_;           // final assembled prompt
     double confidence_threshold_;
     std::vector<std::string> target_classes_;  // empty = all classes
     int max_detections_;
     int queue_size_;
     int min_crop_size_;
+
+    // Behavior classes
+    std::vector<BehaviorClass> behavior_classes_;
 
     // ROS2 interfaces
     message_filters::Subscriber<vision_msgs::msg::Detection2DArray> det_sub_;
