@@ -1,0 +1,330 @@
+#include "llama_behavior_ros2/llama_behavior_node.hpp"
+
+#include <curl/curl.h>
+#include <opencv2/imgcodecs.hpp>
+#include <algorithm>
+#include <sstream>
+#include <iomanip>
+
+namespace llama_behavior_ros2
+{
+
+// ======================== Base64 encoding ========================
+static const std::string base64_chars =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static std::string base64Encode(const unsigned char *data, size_t len)
+{
+    std::string result;
+    result.reserve(((len + 2) / 3) * 4);
+
+    for (size_t i = 0; i < len; i += 3) {
+        unsigned int n = (static_cast<unsigned int>(data[i]) << 16);
+        if (i + 1 < len) n |= (static_cast<unsigned int>(data[i + 1]) << 8);
+        if (i + 2 < len) n |= static_cast<unsigned int>(data[i + 2]);
+
+        result += base64_chars[(n >> 18) & 0x3F];
+        result += base64_chars[(n >> 12) & 0x3F];
+        result += (i + 1 < len) ? base64_chars[(n >> 6) & 0x3F] : '=';
+        result += (i + 2 < len) ? base64_chars[n & 0x3F] : '=';
+    }
+    return result;
+}
+
+// ======================== JSON string escape ========================
+static std::string jsonEscape(const std::string &s)
+{
+    std::string result;
+    result.reserve(s.size() + 8);
+    for (char c : s) {
+        switch (c) {
+            case '"':  result += "\\\""; break;
+            case '\\': result += "\\\\"; break;
+            case '\n': result += "\\n";  break;
+            case '\r': result += "\\r";  break;
+            case '\t': result += "\\t";  break;
+            default:   result += c;      break;
+        }
+    }
+    return result;
+}
+
+// ======================== CURL write callback ========================
+static size_t curlWriteCallback(void *contents, size_t size, size_t nmemb, std::string *output)
+{
+    size_t total = size * nmemb;
+    output->append(static_cast<char *>(contents), total);
+    return total;
+}
+
+// ======================== Constructor ========================
+LlamaBehaviorNode::LlamaBehaviorNode(const rclcpp::NodeOptions &options)
+    : Node("llama_behavior_node", options)
+{
+    // Declare and get parameters
+    declare_parameter<std::string>("server_url", "http://127.0.0.1:8080/v1/chat/completions");
+    declare_parameter<std::string>("prompt", "请描述图片中人物的行为动作");
+    declare_parameter<double>("confidence_threshold", 0.5);
+    declare_parameter<std::vector<std::string>>("target_classes", std::vector<std::string>{"person"});
+    declare_parameter<int>("max_detections", 3);
+    declare_parameter<int>("queue_size", 10);
+    declare_parameter<std::string>("detection_topic", "/yolov11/detections");
+    declare_parameter<std::string>("image_topic", "/camera/image_raw");
+    declare_parameter<std::string>("behavior_topic", "/llama/behavior");
+    declare_parameter<int>("min_crop_size", 50);
+
+    server_url_ = get_parameter("server_url").as_string();
+    prompt_ = get_parameter("prompt").as_string();
+    confidence_threshold_ = get_parameter("confidence_threshold").as_double();
+    target_classes_ = get_parameter("target_classes").as_string_array();
+    max_detections_ = get_parameter("max_detections").as_int();
+    queue_size_ = get_parameter("queue_size").as_int();
+    min_crop_size_ = get_parameter("min_crop_size").as_int();
+
+    std::string detection_topic = get_parameter("detection_topic").as_string();
+    std::string image_topic = get_parameter("image_topic").as_string();
+    std::string behavior_topic = get_parameter("behavior_topic").as_string();
+
+    RCLCPP_INFO(get_logger(), "Server URL: %s", server_url_.c_str());
+    RCLCPP_INFO(get_logger(), "Prompt: %s", prompt_.c_str());
+    RCLCPP_INFO(get_logger(), "Confidence threshold: %.2f", confidence_threshold_);
+    RCLCPP_INFO(get_logger(), "Min crop size: %d px", min_crop_size_);
+
+    if (!target_classes_.empty()) {
+        std::string classes_str;
+        for (size_t i = 0; i < target_classes_.size(); ++i) {
+            if (i > 0) classes_str += ", ";
+            classes_str += target_classes_[i];
+        }
+        RCLCPP_INFO(get_logger(), "Target classes: [%s]", classes_str.c_str());
+    } else {
+        RCLCPP_INFO(get_logger(), "Target classes: ALL");
+    }
+
+    // Initialize CURL globally
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+
+    // Create synchronized subscribers (ApproximateTime sync)
+    det_sub_.subscribe(this, detection_topic);
+    img_sub_.subscribe(this, image_topic);
+
+    sync_ = std::make_shared<message_filters::Synchronizer<DetectionSync>>(
+        DetectionSync(queue_size_), det_sub_, img_sub_);
+    sync_->registerCallback(&LlamaBehaviorNode::syncCallback, this);
+
+    // Publisher
+    behavior_pub_ = create_publisher<std_msgs::msg::String>(behavior_topic, 10);
+
+    RCLCPP_INFO(get_logger(), "Llama behavior node initialized.");
+    RCLCPP_INFO(get_logger(), "Subscribing: %s + %s", detection_topic.c_str(), image_topic.c_str());
+    RCLCPP_INFO(get_logger(), "Publishing to: %s", behavior_topic.c_str());
+}
+
+LlamaBehaviorNode::~LlamaBehaviorNode()
+{
+    curl_global_cleanup();
+}
+
+// ======================== Sync callback ========================
+void LlamaBehaviorNode::syncCallback(
+    const vision_msgs::msg::Detection2DArray::ConstSharedPtr det_msg,
+    const sensor_msgs::msg::Image::ConstSharedPtr img_msg)
+{
+    // Skip if still processing previous frame
+    if (processing_.load()) {
+        RCLCPP_DEBUG(get_logger(), "Skipping frame, still processing...");
+        return;
+    }
+
+    // Convert ROS image to OpenCV
+    cv_bridge::CvImagePtr cv_ptr;
+    try {
+        cv_ptr = cv_bridge::toCvCopy(img_msg, sensor_msgs::image_encodings::BGR8);
+    } catch (cv_bridge::Exception &e) {
+        RCLCPP_ERROR(get_logger(), "cv_bridge exception: %s", e.what());
+        return;
+    }
+
+    cv::Mat image = cv_ptr->image;
+
+    // Filter detections
+    std::vector<std::pair<int, std::string>> valid_dets;
+    for (size_t i = 0; i < det_msg->detections.size(); ++i) {
+        const auto &det = det_msg->detections[i];
+        if (det.results.empty()) continue;
+
+        float conf = det.results[0].hypothesis.score;
+        std::string cls = det.results[0].hypothesis.class_id;
+
+        if (conf < confidence_threshold_) continue;
+
+        // Filter by target classes
+        if (!target_classes_.empty()) {
+            bool match = false;
+            for (const auto &tc : target_classes_) {
+                if (cls == tc) { match = true; break; }
+            }
+            if (!match) continue;
+        }
+
+        valid_dets.push_back({static_cast<int>(i), cls});
+        if (static_cast<int>(valid_dets.size()) >= max_detections_) break;
+    }
+
+    if (valid_dets.empty()) return;
+
+    // Crop and encode
+    std::vector<std::string> images_b64;
+    std::vector<std::string> class_names;
+
+    for (const auto &[idx, cls] : valid_dets) {
+        std::string b64 = cropAndEncodeBase64(image, det_msg->detections[idx]);
+        if (!b64.empty()) {
+            images_b64.push_back(b64);
+            class_names.push_back(cls);
+        }
+    }
+
+    if (images_b64.empty()) return;
+
+    // Process asynchronously
+    processing_.store(true);
+    auto self = this->shared_from_this();
+    std::thread([this, self, images_b64, class_names]() {
+        std::string result = callLlamaServer(images_b64, class_names);
+        processing_.store(false);
+
+        if (!result.empty()) {
+            auto msg = std_msgs::msg::String();
+            msg.data = result;
+            behavior_pub_->publish(msg);
+            RCLCPP_INFO(get_logger(), "Behavior result: %s", result.c_str());
+        }
+    }).detach();
+}
+
+// ======================== Crop and encode ========================
+std::string LlamaBehaviorNode::cropAndEncodeBase64(
+    const cv::Mat &image,
+    const vision_msgs::msg::Detection2D &det)
+{
+    float cx = det.bbox.center.position.x;
+    float cy = det.bbox.center.position.y;
+    float w = det.bbox.size_x;
+    float h = det.bbox.size_y;
+
+    int x1 = std::max(0, static_cast<int>(cx - w / 2.0f));
+    int y1 = std::max(0, static_cast<int>(cy - h / 2.0f));
+    int x2 = std::min(image.cols, static_cast<int>(cx + w / 2.0f));
+    int y2 = std::min(image.rows, static_cast<int>(cy + h / 2.0f));
+
+    // Skip too small crops
+    if ((x2 - x1) < min_crop_size_ || (y2 - y1) < min_crop_size_) {
+        return "";
+    }
+
+    cv::Mat cropped = image(cv::Rect(x1, y1, x2 - x1, y2 - y1));
+
+    // Encode as JPEG
+    std::vector<uchar> buf;
+    std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, 85};
+    cv::imencode(".jpg", cropped, buf, params);
+
+    return base64Encode(buf.data(), buf.size());
+}
+
+// ======================== Call llama.cpp server ========================
+std::string LlamaBehaviorNode::callLlamaServer(
+    const std::vector<std::string> &images_b64,
+    const std::vector<std::string> &class_names)
+{
+    // Build JSON manually (avoids nlohmann-json dependency)
+    // OpenAI-compatible format for llama.cpp server
+    std::ostringstream json;
+    json << "{"
+         << "\"model\":\"ggml-model\","
+         << "\"messages\":[{\"role\":\"user\",\"content\":[";
+
+    // Add text prompt
+    json << "{\"type\":\"text\",\"text\":\"" << jsonEscape(prompt_) << "\"},";
+
+    // Add images
+    for (size_t i = 0; i < images_b64.size(); ++i) {
+        json << "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64,"
+             << images_b64[i] << "\"}}";
+        if (i + 1 < images_b64.size()) json << ",";
+    }
+
+    json << "]}],"
+         << "\"max_tokens\":256,"
+         << "\"temperature\":0.1"
+         << "}";
+
+    std::string json_str = json.str();
+
+    // CURL request
+    CURL *curl = curl_easy_init();
+    if (!curl) {
+        RCLCPP_ERROR(get_logger(), "Failed to init CURL");
+        return "";
+    }
+
+    std::string response;
+    struct curl_slist *headers = nullptr;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+
+    curl_easy_setopt(curl, CURLOPT_URL, server_url_.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_str.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlWriteCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
+
+    CURLcode res = curl_easy_perform(curl);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    if (res != CURLE_OK) {
+        RCLCPP_ERROR(get_logger(), "CURL error: %s", curl_easy_strerror(res));
+        return "";
+    }
+
+    // Simple JSON response parsing - extract "content" from response
+    // Find "content":"..." in the response
+    size_t content_pos = response.find("\"content\":\"");
+    if (content_pos == std::string::npos) {
+        // Try alternative format with array
+        content_pos = response.find("\"content\":");
+        if (content_pos == std::string::npos) {
+            RCLCPP_WARN(get_logger(), "Could not parse response: %s", response.c_str());
+            return response.substr(0, 200);  // Return raw response fragment
+        }
+    }
+
+    // Simple extraction for string content
+    size_t start = response.find("\"", content_pos + 10);
+    if (start == std::string::npos) return "";
+    start++;
+
+    std::string content;
+    for (size_t i = start; i < response.size(); ++i) {
+        if (response[i] == '\\' && i + 1 < response.size()) {
+            switch (response[i + 1]) {
+                case '"':  content += '"';  break;
+                case 'n':  content += '\n'; break;
+                case 't':  content += '\t'; break;
+                case '\\': content += '\\'; break;
+                default:   content += response[i + 1]; break;
+            }
+            ++i;
+        } else if (response[i] == '"') {
+            break;
+        } else {
+            content += response[i];
+        }
+    }
+
+    return content;
+}
+
+} // namespace llama_behavior_ros2

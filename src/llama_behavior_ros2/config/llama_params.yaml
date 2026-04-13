@@ -1,0 +1,27 @@
+llama_behavior_node:
+  ros__parameters:
+    # llama.cpp server endpoint
+    server_url: "http://127.0.0.1:8080/v1/chat/completions"
+
+    # Prompt for the multimodal model
+    prompt: "请描述图片中人物的行为动作"
+
+    # Minimum detection confidence to consider
+    confidence_threshold: 0.5
+
+    # Only process these classes (empty = process all)
+    target_classes: ["person"]
+
+    # Max detections to process per frame (avoid overloading server)
+    max_detections: 3
+
+    # Sync queue size
+    queue_size: 10
+
+    # Topics (must match YOLO node config)
+    detection_topic: "/yolov11/detections"
+    image_topic: "/camera/image_raw"
+    behavior_topic: "/llama/behavior"
+
+    # Minimum crop size in pixels (skip tiny detections)
+    min_crop_size: 50
