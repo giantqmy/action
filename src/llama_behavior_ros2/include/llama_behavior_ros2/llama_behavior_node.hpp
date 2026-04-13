@@ -9,6 +9,7 @@
 #include <message_filters/synchronizer.h>
 #include <message_filters/sync_policies/approximate_time.h>
 #include <cv_bridge/cv_bridge.h>
+#include <image_transport/image_transport.hpp>
 
 #include <string>
 #include <vector>
@@ -61,6 +62,16 @@ private:
     /// Default behavior class definitions (水域安全行为识别)
     static std::vector<BehaviorClass> defaultBehaviorClasses();
 
+    /// Get severity color (BGR): critical=red, warning=yellow, normal=green
+    static cv::Scalar severityColor(const std::string &severity);
+
+    /// Draw behavior annotations on full image for rviz2 visualization
+    cv::Mat drawBehaviorAnnotations(
+        const cv::Mat &image,
+        const vision_msgs::msg::Detection2DArray &dets,
+        const std::vector<int> &valid_indices,
+        const std::vector<std::string> &behavior_results);
+
     // Parameters
     std::string server_url_;
     std::string prompt_template_;  // prompt template with {categories_text} and {valid_ids} placeholders
@@ -70,6 +81,7 @@ private:
     int max_detections_;
     int queue_size_;
     int min_crop_size_;
+    bool publish_result_image_;
 
     // Behavior classes
     std::vector<BehaviorClass> behavior_classes_;
@@ -79,6 +91,7 @@ private:
     message_filters::Subscriber<sensor_msgs::msg::Image> img_sub_;
     std::shared_ptr<message_filters::Synchronizer<DetectionSync>> sync_;
     rclcpp::Publisher<std_msgs::msg::String> behavior_pub_;
+    image_transport::Publisher result_image_pub_;
 
     // Async processing
     std::atomic<bool> processing_{false};

@@ -194,6 +194,7 @@ ros2 run image_tools cam2image --ros-args -p frequency:=30.0
 | `detection_topic` | /yolov11/detections | 订阅的检测话题 |
 | `image_topic` | /camera/image_raw | 订阅的图像话题 |
 | `behavior_topic` | /llama/behavior | 行为描述输出话题 |
+| `publish_result_image` | true | 是否发布带行为标注的可视化图像 |
 
 ## 水域安全行为识别 Prompt
 
@@ -288,9 +289,38 @@ ros2 run llama_behavior_ros2 llama_behavior_node \
 | `/camera/image_raw` | sensor_msgs/Image | 输入 | 相机原始图像 |
 | `/yolov11/detections` | vision_msgs/Detection2DArray | YOLO→LLaMA | 检测结果 |
 | `/yolov11/result_image` | sensor_msgs/Image | 输出 | 带检测框的可视化图像 |
-| `/llama/behavior` | std_msgs/String | 输出 | LLaMA 生成的行为描述 |
+| `/llama/behavior` | std_msgs/String | 输出 | LLaMA 生成的行为描述 (JSON) |
+| `/llama/behavior/image` | sensor_msgs/Image | 输出 | 叠加行为标注的可视化图像 |
 
 ## 调试
+
+### rviz2 可视化
+
+LLaMA 节点发布 `/llama/behavior/image` 话题，将行为识别结果画回原图：
+
+- **红色框** `critical` — 溺水等高危行为
+- **黄色框** `warning` — 攀爬栏杆等警告行为
+- **绿色框`normal` — 游泳、行走等正常行为
+
+标签格式：`drowning 0.92 [critical]`
+
+```bash
+# 启动 rviz2
+rviz2
+
+# 添加 Image 显示面板，订阅以下话题之一：
+# /yolov11/result_image       — YOLOv11 检测框
+# /llama/behavior/image       — LLaMA 行为标注（推荐）
+# /camera/image_raw           — 原始相机画面
+```
+
+也可用 `rqt_image_view` 快速查看：
+
+```bash
+ros2 run rqt_image_view rqt_image_view /llama/behavior/image
+```
+
+### 常用命令
 
 ```bash
 # 查看话题列表

@@ -32,3 +32,6 @@ llama_behavior_node:
 
     # Minimum crop size in pixels (skip tiny detections)
     min_crop_size: 50
+
+    # Publish visualization image with behavior annotations (for rviz2)
+    publish_result_image: true

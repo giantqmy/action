@@ -167,6 +167,7 @@ LlamaBehaviorNode::LlamaBehaviorNode(const rclcpp::NodeOptions &options)
     declare_parameter<std::string>("image_topic", "/camera/image_raw");
     declare_parameter<std::string>("behavior_topic", "/llama/behavior");
     declare_parameter<int>("min_crop_size", 50);
+    declare_parameter<bool>("publish_result_image", true);
 
     server_url_ = get_parameter("server_url").as_string();
     prompt_template_ = get_parameter("prompt_template").as_string();
@@ -175,6 +176,7 @@ LlamaBehaviorNode::LlamaBehaviorNode(const rclcpp::NodeOptions &options)
     max_detections_ = get_parameter("max_detections").as_int();
     queue_size_ = get_parameter("queue_size").as_int();
     min_crop_size_ = get_parameter("min_crop_size").as_int();
+    publish_result_image_ = get_parameter("publish_result_image").as_bool();
 
     // Initialize behavior classes
     behavior_classes_ = defaultBehaviorClasses();
@@ -218,6 +220,10 @@ LlamaBehaviorNode::LlamaBehaviorNode(const rclcpp::NodeOptions &options)
     // Publisher
     behavior_pub_ = create_publisher<std_msgs::msg::String>(behavior_topic, 10);
 
+    if (publish_result_image_) {
+        result_image_pub_ = image_transport::create_publisher(this, behavior_topic + "/image");
+    }
+
     RCLCPP_INFO(get_logger(), "Llama behavior node initialized.");
     RCLCPP_INFO(get_logger(), "Subscribing: %s + %s", detection_topic.c_str(), image_topic.c_str());
     RCLCPP_INFO(get_logger(), "Publishing to: %s", behavior_topic.c_str());
@@ -226,6 +232,123 @@ LlamaBehaviorNode::LlamaBehaviorNode(const rclcpp::NodeOptions &options)
 LlamaBehaviorNode::~LlamaBehaviorNode()
 {
     curl_global_cleanup();
+}
+
+// ======================== Severity color ========================
+cv::Scalar LlamaBehaviorNode::severityColor(const std::string &severity)
+{
+    if (severity == "critical") return cv::Scalar(0, 0, 255);   // 红色 (BGR)
+    if (severity == "warning")  return cv::Scalar(0, 200, 255); // 黄色
+    return cv::Scalar(0, 220, 0);                               // 绿色 (normal)
+}
+
+// ======================== Draw behavior annotations ========================
+cv::Mat LlamaBehaviorNode::drawBehaviorAnnotations(
+    const cv::Mat &image,
+    const vision_msgs::msg::Detection2DArray &dets,
+    const std::vector<int> &valid_indices,
+    const std::vector<std::string> &behavior_results)
+{
+    cv::Mat vis = image.clone();
+
+    for (size_t k = 0; k < valid_indices.size(); ++k) {
+        int idx = valid_indices[k];
+        if (idx < 0 || idx >= static_cast<int>(dets.detections.size())) continue;
+
+        const auto &det = dets.detections[idx];
+        float cx = det.bbox.center.position.x;
+        float cy = det.bbox.center.position.y;
+        float w = det.bbox.size_x;
+        float h = det.bbox.size_y;
+
+        int x1 = std::max(0, static_cast<int>(cx - w / 2.0f));
+        int y1 = std::max(0, static_cast<int>(cy - h / 2.0f));
+        int x2 = std::min(vis.cols, static_cast<int>(cx + w / 2.0f));
+        int y2 = std::min(vis.rows, static_cast<int>(cy + h / 2.0f));
+
+        // 尝试从 LLaMA JSON 输出中解析 severity 和 label
+        std::string severity = "normal";
+        std::string label = "unknown";
+        if (k < behavior_results.size()) {
+            const std::string &json_str = behavior_results[k];
+
+            // 简单解析 severity
+            size_t sev_pos = json_str.find("\"severity\"");
+            if (sev_pos != std::string::npos) {
+                size_t colon = json_str.find(":", sev_pos);
+                if (colon != std::string::npos) {
+                    size_t val_start = json_str.find("\"", colon + 1);
+                    if (val_start != std::string::npos) {
+                        val_start++;
+                        size_t val_end = json_str.find("\"", val_start);
+                        if (val_end != std::string::npos) {
+                            severity = json_str.substr(val_start, val_end - val_start);
+                        }
+                    }
+                }
+            }
+
+            // 简单解析 behavior_label
+            size_t lbl_pos = json_str.find("\"behavior_label\"");
+            if (lbl_pos != std::string::npos) {
+                size_t colon = json_str.find(":", lbl_pos);
+                if (colon != std::string::npos) {
+                    size_t val_start = json_str.find("\"", colon + 1);
+                    if (val_start != std::string::npos) {
+                        val_start++;
+                        size_t val_end = json_str.find("\"", val_start);
+                        if (val_end != std::string::npos) {
+                            label = json_str.substr(val_start, val_end - val_start);
+                        }
+                    }
+                }
+            }
+
+            // 简单解析 confidence
+            std::string conf_str;
+            size_t conf_pos = json_str.find("\"confidence\"");
+            if (conf_pos != std::string::npos) {
+                size_t colon = json_str.find(":", conf_pos);
+                if (colon != std::string::npos) {
+                    size_t val_start = colon + 1;
+                    while (val_start < json_str.size() && json_str[val_start] == ' ') val_start++;
+                    size_t val_end = val_start;
+                    while (val_end < json_str.size() && (std::isdigit(json_str[val_end]) || json_str[val_end] == '.')) val_end++;
+                    if (val_end > val_start) {
+                        conf_str = " " + json_str.substr(val_start, val_end - val_start);
+                    }
+                }
+            }
+
+            cv::Scalar color = severityColor(severity);
+
+            // 绘制检测框（粗线，颜色随严重等级变化）
+            cv::rectangle(vis, cv::Point(x1, y1), cv::Point(x2, y2), color, 3);
+
+            // 构建标签文字: "drowning 0.92 [critical]"
+            std::string display_label = label + conf_str + " [" + severity + "]";
+
+            // 绘制标签背景
+            int baseline = 0;
+            double font_scale = 0.6;
+            cv::Size text_size = cv::getTextSize(display_label, cv::FONT_HERSHEY_SIMPLEX, font_scale, 2, &baseline);
+            int label_y = y1 - 8;
+            if (label_y - text_size.height < 0) label_y = y2 + text_size.height + 8;
+
+            cv::rectangle(vis,
+                          cv::Point(x1, label_y - text_size.height - 4),
+                          cv::Point(x1 + text_size.width + 8, label_y + 4),
+                          color, -1);
+
+            // 绘制标签文字（白色）
+            cv::putText(vis, display_label,
+                        cv::Point(x1 + 4, label_y),
+                        cv::FONT_HERSHEY_SIMPLEX, font_scale,
+                        cv::Scalar(255, 255, 255), 2);
+        }
+    }
+
+    return vis;
 }
 
 // ======================== Sync callback ========================
@@ -313,7 +436,19 @@ void LlamaBehaviorNode::syncCallback(
     // [阶段4] 异步调用 LLaMA 服务器（HTTP请求是最大时延瓶颈）
     processing_.store(true);
     auto self = this->shared_from_this();
-    std::thread([this, self, images_b64, class_names, t_crop]() {
+
+    // 收集有效检测的索引，供可视化绘制使用
+    std::vector<int> valid_indices;
+    for (const auto &[idx, cls] : valid_dets) {
+        valid_indices.push_back(idx);
+    }
+
+    // 复制原图和检测消息，传入异步线程
+    cv::Mat full_image = image.clone();
+    auto det_msg_copy = std::make_shared<vision_msgs::msg::Detection2DArray>(*det_msg);
+
+    std::thread([this, self, images_b64, class_names, t_crop,
+                 full_image, det_msg_copy, valid_indices]() {
         auto t_thread_start = std::chrono::high_resolution_clock::now();
 
         std::string result = callLlamaServer(images_b64, class_names);
@@ -326,6 +461,20 @@ void LlamaBehaviorNode::syncCallback(
             auto msg = std_msgs::msg::String();
             msg.data = result;
             behavior_pub_->publish(msg);
+        }
+
+        // 可视化: 将行为结果画回原图，发布到 /llama/behavior/image
+        // 原图未被裁剪影响，syncCallback 传入的是完整帧
+        if (publish_result_image_ && !result.empty()) {
+            // 提取每个检测的行为结果（简单复用同一结果，每个检测独立显示）
+            std::vector<std::string> behavior_results;
+            for (size_t i = 0; i < valid_indices.size(); ++i) {
+                behavior_results.push_back(result);
+            }
+            cv::Mat vis_image = drawBehaviorAnnotations(
+                full_image, *det_msg_copy, valid_indices, behavior_results);
+            auto vis_msg = cv_bridge::CvImage(det_msg_copy->header, "bgr8", vis_image).toImageMsg();
+            result_image_pub_.publish(vis_msg);
         }
         auto t_pub = std::chrono::high_resolution_clock::now();
 
